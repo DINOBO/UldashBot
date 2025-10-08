@@ -194,7 +194,26 @@ namespace UldashBot.Services
                         else if (text == "Поиск рейсов" && _storage.Model.Users[chatId].Role == "Попутчик")
                         {
                             SetUserState(chatId, "passenger_departure");
-                            await _bot.SendMessage(chatId, "Откуда:");
+                            // Показываем кнопки с городами
+                            var keyboard = new InlineKeyboardMarkup(new[]
+                            {
+        new[]
+        {
+            InlineKeyboardButton.WithCallbackData("Уфа", "Уфа"),
+            InlineKeyboardButton.WithCallbackData("Инзер", "Инзер")
+        },
+        new[]
+        {
+            InlineKeyboardButton.WithCallbackData("Белорецк", "Белорецк"),
+            InlineKeyboardButton.WithCallbackData("Аскарово", "Аскарово")
+        },
+        new[]
+        {
+            InlineKeyboardButton.WithCallbackData("Магнитогорск", "Магнитогорск")
+        }
+    });
+
+                            await _bot.SendMessage(chatId, "Откуда:", replyMarkup: keyboard);
                         }
                         else if (text == "Выбрать роль")
                         {
@@ -350,7 +369,26 @@ namespace UldashBot.Services
                     {
                         _storage.Model.Users[chatId].Departure = text;
                         SetUserState(chatId, "passenger_arrival");
-                        await _bot.SendMessage(chatId, "Куда:");
+                        // Показываем кнопки с городами
+                        var keyboard = new InlineKeyboardMarkup(new[]
+                        {
+        new[]
+        {
+            InlineKeyboardButton.WithCallbackData("Уфа", "Уфа"),
+            InlineKeyboardButton.WithCallbackData("Инзер", "Инзер")
+        },
+        new[]
+        {
+            InlineKeyboardButton.WithCallbackData("Белорецк", "Белорецк"),
+            InlineKeyboardButton.WithCallbackData("Аскарово", "Аскарово")
+        },
+        new[]
+        {
+            InlineKeyboardButton.WithCallbackData("Магнитогорск", "Магнитогорск")
+        }
+    });
+
+                        await _bot.SendMessage(chatId, "Куда:", replyMarkup: keyboard);
                         _storage.MarkDirtyAndSave();
                         break;
                     }
