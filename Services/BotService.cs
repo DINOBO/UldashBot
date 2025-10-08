@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.ComponentModel.Design;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
@@ -150,7 +151,7 @@ namespace UldashBot.Services
                     {
                         _storage.Model.Users[chatId].Name = text;
                         SetUserState(chatId, "waiting_phone");
-                        await _bot.SendMessage(chatId, "Сәләм! Введите номер телефона:");
+                        await _bot.SendMessage(chatId, "Введите номер телефона:");
                         _storage.MarkDirtyAndSave();
                         break;
                     }
@@ -190,10 +191,10 @@ namespace UldashBot.Services
                             SetUserState(chatId, "driver_waiting_date");
                             await _bot.SendMessage(chatId, "Выберите дату:", replyMarkup: DateKeyboard());
                         }
-                        else if (text == "Поиск рейса" && _storage.Model.Users[chatId].Role == "Попутчик")
+                        else if (text == "Поиск рейсов" && _storage.Model.Users[chatId].Role == "Попутчик")
                         {
                             SetUserState(chatId, "passenger_departure");
-                            await _bot.SendMessage(chatId, "Введите город отправления:");
+                            await _bot.SendMessage(chatId, "Откуда:");
                         }
                         else if (text == "Выбрать роль")
                         {
@@ -205,10 +206,28 @@ namespace UldashBot.Services
                             { ResizeKeyboard = true };
                             await _bot.SendMessage(chatId, "Выберите роль:", replyMarkup: roleKeyboard2);
                         }
-                        else if (text == "Редактировать данные")
+                        else if (text == "Мои данные")
+                        {
+                            var roleKeyboard2 = new ReplyKeyboardMarkup(new[]
+                            {
+                                new KeyboardButton[] { "Изменить", "Назад в меню" }
+                            })
+                            { ResizeKeyboard = true };
+                            await _bot.SendMessage(chatId, $"Ваше имя: {_storage.Model.Users[chatId].Name}, ваш номер: {_storage.Model.Users[chatId].Phone}", replyMarkup: roleKeyboard2);
+                        }
+                        else if (text == "Изменить")
                         {
                             SetUserState(chatId, "waiting_name");
-                            await _bot.SendMessage(chatId, "Введите новое имя:");
+                            await _bot.SendMessage(chatId, "Введите имя:");
+                            _storage.MarkDirtyAndSave();
+                            break;
+                        }
+                        else if (text == "Назад в меню")
+                        {
+                            SetUserState(chatId, "main_menu");
+                            await _bot.SendMessage(chatId, "Выберите функцию:", replyMarkup: MainMenu(chatId));
+                            _storage.MarkDirtyAndSave();
+                            break;
                         }
                         else if (text == "Управление рейсами" && _storage.Model.Users[chatId].Role == "Водитель")
                         {
@@ -216,8 +235,42 @@ namespace UldashBot.Services
                         }
                         else
                         {
-                            await _bot.SendMessage(chatId, "Команда не распознана, пожалуйста пользуйтесь меню", replyMarkup: MainMenu(chatId));
+                            await _bot.SendMessage(chatId, "Пожалуйста, пользуйтесь меню", replyMarkup: MainMenu(chatId));
                         }
+                        break;
+                    }
+                case "driver_waiting_departure":
+                    {
+                        _storage.Model.Users[chatId].Departure = text; 
+                        SetUserState(chatId, "driver_waiting_arrival");
+                        // Показываем кнопки с городами
+                        var keyboard = new InlineKeyboardMarkup(new[]
+                        {
+        new[]
+        {
+            InlineKeyboardButton.WithCallbackData("Уфа", "Уфа"),
+            InlineKeyboardButton.WithCallbackData("Инзер", "Инзер")
+        },
+        new[]
+        {
+            InlineKeyboardButton.WithCallbackData("Белорецк", "Белорецк"),
+            InlineKeyboardButton.WithCallbackData("Аскарово", "Аскарово")
+        },
+        new[]
+        {
+            InlineKeyboardButton.WithCallbackData("Магнитогорск", "Магнитогорск")
+        }
+    });
+
+                        await _bot.SendMessage(chatId, "Куда:", replyMarkup: keyboard);
+                        break;
+                    }
+                case "driver_waiting_arrival":
+                    {
+                        _storage.Model.Users[chatId].Arrival = text;
+                        SetUserState(chatId, "driver_waiting_time");
+                        await _bot.SendMessage(chatId, "Введите время и место отправления (например, 15:00 Центральный Автовокзал):");
+                        _storage.MarkDirtyAndSave();
                         break;
                     }
                 case "driver_waiting_time":
@@ -231,24 +284,16 @@ namespace UldashBot.Services
                 case "driver_waiting_car":
                     {
                         _storage.Model.Users[chatId].Car = text;
-                        SetUserState(chatId, "driver_waiting_departure");
-                        await _bot.SendMessage(chatId, "Введите город отправления:");
+                        SetUserState(chatId, "driver_waiting_price");
+                        await _bot.SendMessage(chatId, "Цена проезда:");
                         _storage.MarkDirtyAndSave();
                         break;
                     }
-                case "driver_waiting_departure":
+                case "driver_waiting_price":
                     {
-                        _storage.Model.Users[chatId].Departure = text;
-                        SetUserState(chatId, "driver_waiting_arrival");
-                        await _bot.SendMessage(chatId, "Введите город назначения:");
-                        _storage.MarkDirtyAndSave();
-                        break;
-                    }
-                case "driver_waiting_arrival":
-                    {
-                        _storage.Model.Users[chatId].Arrival = text;
+                        _storage.Model.Users[chatId].Price = text;
                         SetUserState(chatId, "driver_waiting_seats");
-                        await _bot.SendMessage(chatId, "Введите количество мест:");
+                        await _bot.SendMessage(chatId, "Количество мест:");
                         _storage.MarkDirtyAndSave();
                         break;
                     }
@@ -277,6 +322,7 @@ namespace UldashBot.Services
                             Time = profile.Time ?? DateTime.Now.ToString("HH:mm"),
                             Departure = profile.Departure ?? "-",
                             Arrival = profile.Arrival ?? "-",
+                            Price = profile.Price,
                             Seats = seats,
                             Passengers = new List<long>()
                         };
@@ -291,6 +337,7 @@ namespace UldashBot.Services
                             $"*Маршрут:* {trip.Departure} → {trip.Arrival}\n" +
                             $"*Дата и время:* {trip.Date} {trip.Time}\n" +
                             $"*Авто:* {trip.Car}\n" +
+                            $"*Цена:* {trip.Price}\n" +
                             $"*Мест:* {trip.Seats}\n\n" +
                             $"Вы можете управлять рейсом через 'Управление рейсами'.";
 
@@ -303,7 +350,7 @@ namespace UldashBot.Services
                     {
                         _storage.Model.Users[chatId].Departure = text;
                         SetUserState(chatId, "passenger_arrival");
-                        await _bot.SendMessage(chatId, "Введите город назначения:");
+                        await _bot.SendMessage(chatId, "Куда:");
                         _storage.MarkDirtyAndSave();
                         break;
                     }
@@ -365,8 +412,27 @@ namespace UldashBot.Services
             {
                 string date = data.Split('_')[1];
                 _storage.Model.Users[chatId].Date = date;
-                SetUserState(chatId, "driver_waiting_time");
-                await _bot.SendMessage(chatId, "Введите время отправления в формате ЧЧ:ММ (например 14:30):");
+                SetUserState(chatId, "driver_waiting_departure");
+                // Показываем кнопки с городами
+                var keyboard = new InlineKeyboardMarkup(new[]
+                {
+        new[]
+        {
+            InlineKeyboardButton.WithCallbackData("Уфа", "Уфа"),
+            InlineKeyboardButton.WithCallbackData("Инзер", "Инзер")
+        },
+        new[]
+        {
+            InlineKeyboardButton.WithCallbackData("Белорецк", "Белорецк"),
+            InlineKeyboardButton.WithCallbackData("Аскарово", "Аскарово")
+        },
+        new[]
+        {
+            InlineKeyboardButton.WithCallbackData("Магнитогорск", "Магнитогорск")
+        }
+    });
+
+                await _bot.SendMessage(chatId, "Откуда:", replyMarkup: keyboard);
                 _storage.MarkDirtyAndSave();
                 return;
             }
@@ -431,7 +497,7 @@ namespace UldashBot.Services
                         $"✅ *Ваше место подтверждено!* \n" +
                         $"Маршрут: {trip.Departure} → {trip.Arrival}\n" +
                         $"Дата и время: {trip.Date} {trip.Time}\n" +
-                        $"Водитель: {trip.DriverName} | @{(_bot.GetChat(trip.DriverId).Result.Username ?? "")}\n" +
+                        $"Водитель: {trip.DriverName} | @{((_bot.GetChat(trip.DriverId).Result.Username ?? "").Replace("_", "\\_"))}\n" +
                         $"Телефон водителя: {driverProfile.Phone}";
                     await _bot.SendMessage(passengerId, msg, ParseMode.Markdown);
 
@@ -559,8 +625,8 @@ namespace UldashBot.Services
                     found = true;
                     var kb = new InlineKeyboardMarkup(new[]
                     {
-                        new []{ InlineKeyboardButton.WithCallbackData("Выбрать рейс", "join_"+kv.Key) },
-                        new []{ InlineKeyboardButton.WithCallbackData("Отменить", "cancel_"+kv.Key) }
+                        new []{ InlineKeyboardButton.WithCallbackData("Выбрать рейс", "join_"+kv.Key) }
+                        //new []{ InlineKeyboardButton.WithCallbackData("Отменить", "cancel_"+kv.Key) }
                     });
 
                     var driverId = t.DriverId;
@@ -570,9 +636,10 @@ namespace UldashBot.Services
                         $"🚗 *Рейс найден:*\n" +
                         $"Маршрут: {route}\n" +
                         $"Дата и время: {t.Date} {t.Time}\n" +
-                        $"Водитель: {t.DriverName} | @{(_bot.GetChat(driverId).Result.Username ?? "")}\n" +
+                        $"Водитель: {t.DriverName} | @{((_bot.GetChat(driverId).Result.Username ?? "").Replace("_", "\\_"))}\n" +
                         $"Телефон водителя: {driverPhone}\n" +
                         $"Авто: {t.Car}\n" +
+                        $"Цена: {t.Price}\n" +
                         $"Осталось мест: {seats}";
 
                     await _bot.SendMessage(chatId, message, ParseMode.Markdown, replyMarkup: kb);
@@ -615,6 +682,7 @@ namespace UldashBot.Services
                         $"Маршрут: {route}\n" +
                         $"Дата и время: {trip.Date} {trip.Time}\n" +
                         $"Авто: {trip.Car}\n" +
+                        $"Цена: {trip.Price}\n" +
                         $"Осталось мест: {trip.Seats}\n\n" +
                         $"*Пассажиры:*{passengerInfo}",
                         ParseMode.Markdown,
@@ -657,6 +725,7 @@ namespace UldashBot.Services
                           $"Маршрут: {route}\n" +
                           $"Дата и время: {trip.Date} {trip.Time}\n" +
                           $"Авто: {trip.Car}\n" +
+                          $"Цена: {trip.Price}\n" +
                           $"Осталось мест: {trip.Seats}\n\n" +
                           $"*Пассажиры:*{passengerInfo}",
                     parseMode: ParseMode.Markdown,
@@ -681,7 +750,7 @@ namespace UldashBot.Services
                     new KeyboardButton[] { new KeyboardButton("Создать рейс") },
                     new KeyboardButton[] { new KeyboardButton("Управление рейсами") },
                     new KeyboardButton[] { new KeyboardButton("Выбрать роль") },
-                    new KeyboardButton[] { new KeyboardButton("Редактировать данные") }
+                    new KeyboardButton[] { new KeyboardButton("Мои данные") }
                 })
                 { ResizeKeyboard = true };
             }
@@ -689,9 +758,9 @@ namespace UldashBot.Services
             {
                 return new ReplyKeyboardMarkup(new[]
                 {
-                    new KeyboardButton[] { new KeyboardButton("Поиск рейса") },
+                    new KeyboardButton[] { new KeyboardButton("Поиск рейсов") },
                     new KeyboardButton[] { new KeyboardButton("Выбрать роль") },
-                    new KeyboardButton[] { new KeyboardButton("Редактировать данные") }
+                    new KeyboardButton[] { new KeyboardButton("Мои данные") }
                 })
                 { ResizeKeyboard = true };
             }
@@ -702,12 +771,12 @@ namespace UldashBot.Services
             var buttons = new List<InlineKeyboardButton[]>();
             DateTime today = DateTime.Today;
             var row = new List<InlineKeyboardButton>();
-            for (int i = 0; i < 14; i++)
+            for (int i = 0; i < 7; i++)
             {
                 DateTime d = today.AddDays(i);
                 string text = d.ToString("dd.MM");
                 row.Add(InlineKeyboardButton.WithCallbackData(text, "date_" + text));
-                if (row.Count == 5)
+                if (row.Count == 4)
                 {
                     buttons.Add(row.ToArray());
                     row = new List<InlineKeyboardButton>();

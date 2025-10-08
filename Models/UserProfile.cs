@@ -22,5 +22,6 @@ namespace UldashBot.Models
         public string? Departure { get; set; }
         public string? Arrival { get; set; }
         public string? UserState { get; set; }
+        public string? Price { get; set; }
     }
 }

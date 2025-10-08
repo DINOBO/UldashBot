@@ -19,7 +19,9 @@ namespace UldashBot.Models
         public string Time { get; set; } = ""; // HH:mm
         public string Departure { get; set; } = "";
         public string Arrival { get; set; } = "";
+        public string Price { get; set; }
         public int Seats { get; set; } = 0;
+      
         public List<long> Passengers { get; set; } = new List<long>();
 
         // Для упрощённого сравнения дат/времён — хранится как ISO
