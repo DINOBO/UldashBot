@@ -116,6 +116,7 @@ namespace UldashBot.Services
         {
             var chatId = msg.Chat.Id;
             var text = msg.Text ?? "";
+            bool newPorfile = false;
 
             lock (_stateLock)
             {
@@ -123,13 +124,23 @@ namespace UldashBot.Services
                 {
                     // Инициализируем профиль и стартовое состояние
                     _storage.Model.Users[chatId] = new UserProfile { ChatId = chatId };
+                    newPorfile = true;
                 }
 
                 if (!_userStates.ContainsKey(chatId))
                 {
-                    _userStates[chatId] = "waiting_name";
+                    if (newPorfile)
+                        _userStates[chatId] = "waiting_name";
+                    else
+                        _userStates[chatId] = "main_menu";
                 }
             }
+            if (newPorfile)
+            {
+                await _bot.SendMessage(chatId, "Сәләм! Введите имя:");
+                return;
+            }
+
 
             var state = GetUserState(chatId);
 
@@ -202,6 +213,10 @@ namespace UldashBot.Services
                         else if (text == "Управление рейсами" && _storage.Model.Users[chatId].Role == "Водитель")
                         {
                             await ShowDriverTrips(chatId);
+                        }
+                        else
+                        {
+                            await _bot.SendMessage(chatId, "Команда не распознана, пожалуйста пользуйтесь меню", replyMarkup: MainMenu(chatId));
                         }
                         break;
                     }
@@ -539,7 +554,7 @@ namespace UldashBot.Services
                 if (route.Contains(dep, StringComparison.OrdinalIgnoreCase) && route.Contains(arr, StringComparison.OrdinalIgnoreCase) && seats > 0)
                 {
                     // Если пользователь указал дату — сопоставим
-                    if (!string.IsNullOrEmpty(user.Date) && t.Date != user.Date) continue;
+                    //if (!string.IsNullOrEmpty(user.Date) && t.Date != user.Date) continue;
 
                     found = true;
                     var kb = new InlineKeyboardMarkup(new[]
