@@ -1,449 +1,958 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Encodings.Web;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using Telegram.Bot;
+using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 
-class Program
+namespace RideShareBot
 {
-    static string token = "8481717669:AAGZV3qnhxDIjdC0vxqR3FvDQMv7HGWwE6g";
-    static TelegramBotClient bot = new TelegramBotClient(token);
+    // ----- МОДЕЛИ -----
 
-    static Dictionary<long, string> userStates = new();
-    static Dictionary<long, Dictionary<string, string>> userData = new();
-    static Dictionary<int, Dictionary<string, object>> trips = new();
-    static Dictionary<int, long> pendingRequests = new();
-    static Dictionary<int, int> driverTripMessageId = new();
-    static int tripCounter = 1;
-
-    static async Task Main()
+    /// <summary>
+    /// Пользовательские данные (профиль)
+    /// </summary>
+    public class UserProfile
     {
-        using var cts = new CancellationTokenSource();
-        var receiverOptions = new Telegram.Bot.Polling.ReceiverOptions { AllowedUpdates = { } };
-        bot.StartReceiving(UpdateHandler, ErrorHandler, receiverOptions, cts.Token);
-        Console.WriteLine("Бот запущен...");
-        Thread.Sleep(-1);
+        public long ChatId { get; set; }
+        public string Name { get; set; } = "";
+        public string Phone { get; set; } = "";
+        public string Role { get; set; } = ""; // "Водитель" или "Попутчик"
+        // Временные поля, используемые в процессе диалога (не критично хранить, но для восстановления может быть полезно)
+        public string? Date { get; set; }
+        public string? Time { get; set; }
+        public string? Car { get; set; }
+        public string? Departure { get; set; }
+        public string? Arrival { get; set; }
     }
 
-    static async Task UpdateHandler(ITelegramBotClient botClient, Update update, CancellationToken ct)
+    /// <summary>
+    /// Описание рейса
+    /// </summary>
+    public class Trip
     {
-        if (update.Type == UpdateType.Message)
-        {
-            var msg = update.Message;
-            var chatId = msg.Chat.Id;
+        public int Id { get; set; }
+        public long DriverId { get; set; }
+        public string DriverName { get; set; } = "";
+        public string Car { get; set; } = "-";
+        public string Date { get; set; } = ""; // dd.MM
+        public string Time { get; set; } = ""; // HH:mm
+        public string Departure { get; set; } = "";
+        public string Arrival { get; set; } = "";
+        public int Seats { get; set; } = 0;
+        public List<long> Passengers { get; set; } = new List<long>();
 
-            if (!userStates.ContainsKey(chatId))
+        // Для упрощённого сравнения дат/времён — хранится как ISO
+        public string GetIsoDateTimeString()
+        {
+            // Попробуем спарсить Date (dd.MM) и Time (HH:mm), и составить DateTime в текущем/следующем году.
+            if (DateTime.TryParseExact($"{Date}.{DateTime.Now.Year} {Time}",
+                new[] { "dd.MM.yyyy HH:mm", "d.M.yyyy HH:mm" },
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None,
+                out DateTime dt))
             {
-                userStates[chatId] = "waiting_name";
-                await bot.SendMessage(chatId, "Сәләм! Введите имя:");
-                return;
+                // Если получившаяся дата уже в прошлом, возможно пользователь выбрал дату в начале следующего года — учтём это.
+                if (dt < DateTime.Now.AddHours(-1))
+                {
+                    try
+                    {
+                        dt = new DateTime(dt.Year + 1, dt.Month, dt.Day, dt.Hour, dt.Minute, 0);
+                    }
+                    catch { /*если не удалось — оставим как есть*/ }
+                }
+                return dt.ToString("o"); // ISO 8601
+            }
+            return DateTime.MinValue.ToString("o");
+        }
+
+        public DateTime GetDateTimeOrMin()
+        {
+            var iso = GetIsoDateTimeString();
+            if (DateTime.TryParse(iso, out var dt)) return dt;
+            return DateTime.MinValue;
+        }
+    }
+
+    /// <summary>
+    /// Модель, сериализуемая в JSON — хранит все необходимые для восстановления данных структуры.
+    /// </summary>
+    public class StorageModel
+    {
+        public Dictionary<long, UserProfile> Users { get; set; } = new();
+        public Dictionary<int, Trip> Trips { get; set; } = new();
+        public Dictionary<int, long> PendingRequests { get; set; } = new();
+        public Dictionary<int, int> DriverTripMessageId { get; set; } = new();
+        public int TripCounter { get; set; } = 1;
+    }
+
+    // ----- ХРАНИЛИЩЕ (файл) -----
+
+    /// <summary>
+    /// Класс, отвечающий за загрузку/сохранение данных в JSON файл.
+    /// Сохраняет сразу после изменения — чтобы минимизировать потерю данных при падении.
+    /// </summary>
+    public class Storage
+    {
+        private readonly string _filePath;
+        private readonly object _fileLock = new object();
+
+        public StorageModel Model { get; private set; } = new StorageModel();
+
+        private readonly JsonSerializerOptions _jsonOptions = new JsonSerializerOptions
+        {
+            WriteIndented = true,
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+            Converters =
+            {
+                new JsonStringEnumConverter(JsonNamingPolicy.CamelCase)
+            }
+        };
+
+        public Storage(string filePath = "data.json")
+        {
+            _filePath = filePath;
+        }
+
+        /// <summary>
+        /// Загружает данные из файла, если файл существует.
+        /// </summary>
+        public void Load()
+        {
+            lock (_fileLock)
+            {
+                if (!File.Exists(_filePath))
+                {
+                    Model = new StorageModel();
+                    return;
+                }
+
+                try
+                {
+                    var json = File.ReadAllText(_filePath);
+                    Model = JsonSerializer.Deserialize<StorageModel>(json, _jsonOptions) ?? new StorageModel();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[Storage] Ошибка при загрузке: {ex.Message}");
+                    Model = new StorageModel();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Сохраняет модель в файл.
+        /// </summary>
+        public void Save()
+        {
+            lock (_fileLock)
+            {
+                try
+                {
+                    var json = JsonSerializer.Serialize(Model, _jsonOptions);
+                    File.WriteAllText(_filePath, json);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[Storage] Ошибка при сохранении: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Вызывается когда что-то поменялось — сохраняем.
+        /// </summary>
+        public void MarkDirtyAndSave()
+        {
+            Save();
+        }
+    }
+
+    // ----- СЕРВИС БОТА -----
+
+    public class BotService
+    {
+        private readonly TelegramBotClient _bot;
+        private readonly Storage _storage;
+        private readonly object _stateLock = new(); // защита для пользовательских состояний и модификаций
+        private readonly Dictionary<long, string> _userStates = new(); // runtime состояния (не все сохраняем)
+        private System.Threading.Timer? _cleanupTimer;
+
+        // Ограничение: максимум активных рейсов у водителя
+        private const int MaxTripsPerDriver = 2;
+
+        public BotService(string token, Storage storage)
+        {
+            _bot = new TelegramBotClient(token);
+            _storage = storage;
+        }
+
+        /// <summary>
+        /// Запуск: загрузка данных, настройка таймера очистки, запуск получения обновлений.
+        /// </summary>
+        public async Task StartAsync(CancellationToken cancellationToken)
+        {
+            Console.WriteLine($"Бот запускается.");
+
+            // Удаляем давно просроченные рейсы при старте
+            RemoveExpiredTrips();
+
+            // Таймер регулярно проверяет и удаляет просроченные рейсы (каждую минуту)
+            _cleanupTimer = new System.Threading.Timer(_ => {
+                try
+                {
+                    RemoveExpiredTrips();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[Timer] Ошибка очистки: {ex.Message}");
+                }
+            }, null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+
+            // Подписываемся на события ProcessExit/CancelKeyPress чтобы сохранить состояние при выходе
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => {
+                Console.WriteLine("[Shutdown] Process exit — сохраняем данные...");
+                _storage.MarkDirtyAndSave();
+            };
+            Console.CancelKeyPress += (s, e) => {
+                Console.WriteLine("[Shutdown] CancelKeyPress — сохраняем данные...");
+                _storage.MarkDirtyAndSave();
+            };
+
+            // StartReceiving
+            var receiverOptions = new Telegram.Bot.Polling.ReceiverOptions
+            {
+                AllowedUpdates = { } // receive all
+            };
+
+            _bot.StartReceiving(HandleUpdateAsync, HandleErrorAsync, receiverOptions, cancellationToken);
+            Console.WriteLine("Бот запущен и слушает обновления...");
+            await Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Обработчик ошибок получения апдейтов.
+        /// </summary>
+        private Task HandleErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken ct)
+        {
+            var err = exception switch
+            {
+                ApiRequestException apiEx => $"Telegram API Error:\n[{apiEx.ErrorCode}] {apiEx.Message}",
+                _ => exception.ToString()
+            };
+            Console.WriteLine(err);
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Основной обработчик апдейтов (сообщения + callback queries).
+        /// </summary>
+        private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken ct)
+        {
+            try
+            {
+                if (update.Type == UpdateType.Message && update.Message is { } msg)
+                {
+                    await HandleMessage(msg);
+                }
+                else if (update.Type == UpdateType.CallbackQuery && update.CallbackQuery is { } cb)
+                {
+                    await HandleCallback(cb);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[HandleUpdate] Ошибка: {ex.Message}");
+                // При ошибке — сохраняем состояние
+                _storage.MarkDirtyAndSave();
+            }
+        }
+
+        // ----------------- ОБРАБОТКА СООБЩЕНИЙ -----------------
+
+        private async Task HandleMessage(Message msg)
+        {
+            var chatId = msg.Chat.Id;
+            var text = msg.Text ?? "";
+
+            lock (_stateLock)
+            {
+                if (!_storage.Model.Users.ContainsKey(chatId))
+                {
+                    // Инициализируем профиль и стартовое состояние
+                    _storage.Model.Users[chatId] = new UserProfile { ChatId = chatId };
+                }
+
+                if (!_userStates.ContainsKey(chatId))
+                {
+                    _userStates[chatId] = "waiting_name";
+                }
             }
 
-            string state = userStates[chatId];
-            string text = msg.Text;
+            var state = GetUserState(chatId);
 
             switch (state)
             {
                 case "waiting_name":
-                    if (!userData.ContainsKey(chatId)) userData[chatId] = new();
-                    userData[chatId]["name"] = text;
-                    userStates[chatId] = "waiting_phone";
-                    await bot.SendMessage(chatId, "Введите номер телефона:");
-                    break;
-
+                    {
+                        _storage.Model.Users[chatId].Name = text;
+                        SetUserState(chatId, "waiting_phone");
+                        await _bot.SendMessage(chatId, "Сәләм! Введите номер телефона:");
+                        _storage.MarkDirtyAndSave();
+                        break;
+                    }
                 case "waiting_phone":
-                    userData[chatId]["phone"] = text;
-                    userStates[chatId] = "choosing_role";
-                    var roleKeyboard = new ReplyKeyboardMarkup(
-                        new KeyboardButton[][] { new KeyboardButton[] { "Водитель", "Попутчик" } }
-                    )
-                    { ResizeKeyboard = true };
-                    await bot.SendMessage(chatId, "Выберите роль:", replyMarkup: roleKeyboard);
-                    break;
-
-                case "choosing_role":
-                    userData[chatId]["role"] = text;
-                    await bot.SendMessage(chatId, $"Вы выбрали роль: {text}", replyMarkup: MainMenu(chatId));
-                    userStates[chatId] = "main_menu";
-                    break;
-
-                case "main_menu":
-                    if (text == "Создать рейс" && userData[chatId]["role"] == "Водитель")
                     {
-                        userStates[chatId] = "driver_waiting_date";
-                        await bot.SendMessage(chatId, "Выберите дату:", replyMarkup: DateKeyboard());
-                    }
-                    else if (text == "Поиск рейса" && userData[chatId]["role"] == "Попутчик")
-                    {
-                        userStates[chatId] = "passenger_departure";
-                        await bot.SendMessage(chatId, "Введите город отправления:\n");
-                    }
-                    else if (text == "Выбрать роль")
-                    {
-                        var roleKeyboard2 = new ReplyKeyboardMarkup(
-                            new KeyboardButton[][] { new KeyboardButton[] { "Водитель", "Попутчик" } }
-                        )
+                        _storage.Model.Users[chatId].Phone = text;
+                        SetUserState(chatId, "choosing_role");
+                        var roleKeyboard = new ReplyKeyboardMarkup(new[]
+                        {
+                            new KeyboardButton[] { "Водитель", "Попутчик" }
+                        })
                         { ResizeKeyboard = true };
-                        userStates[chatId] = "choosing_role";
-                        await bot.SendMessage(chatId, "Выберите роль:", replyMarkup: roleKeyboard2);
+                        await _bot.SendMessage(chatId, "Выберите роль:", replyMarkup: roleKeyboard);
+                        _storage.MarkDirtyAndSave();
+                        break;
                     }
-                    else if (text == "Редактировать данные")
+                case "choosing_role":
                     {
-                        userStates[chatId] = "waiting_name";
-                        await bot.SendMessage(chatId, "Введите новое имя:");
+                        _storage.Model.Users[chatId].Role = text;
+                        SetUserState(chatId, "main_menu");
+                        await _bot.SendMessage(chatId, $"Вы выбрали роль: {text}", replyMarkup: MainMenu(chatId));
+                        _storage.MarkDirtyAndSave();
+                        break;
                     }
-                    else if (text == "Управление рейсами" && userData[chatId]["role"] == "Водитель")
+                case "main_menu":
                     {
-                        await ShowDriverTrips(chatId);
-                    }
-                    break;
+                        if (text == "Создать рейс" && _storage.Model.Users[chatId].Role == "Водитель")
+                        {
+                            // Проверить лимит водителя (только будущие рейсы)
+                            int active = CountActiveTripsForDriver(chatId);
+                            if (active >= MaxTripsPerDriver)
+                            {
+                                await _bot.SendMessage(chatId, $"❌ Нельзя создавать больше {MaxTripsPerDriver} активных рейсов. Удалите или дождитесь окончания одного из текущих рейсов.", replyMarkup: MainMenu(chatId));
+                                return;
+                            }
 
+                            SetUserState(chatId, "driver_waiting_date");
+                            await _bot.SendMessage(chatId, "Выберите дату:", replyMarkup: DateKeyboard());
+                        }
+                        else if (text == "Поиск рейса" && _storage.Model.Users[chatId].Role == "Попутчик")
+                        {
+                            SetUserState(chatId, "passenger_departure");
+                            await _bot.SendMessage(chatId, "Введите город отправления:");
+                        }
+                        else if (text == "Выбрать роль")
+                        {
+                            SetUserState(chatId, "choosing_role");
+                            var roleKeyboard2 = new ReplyKeyboardMarkup(new[]
+                            {
+                                new KeyboardButton[] { "Водитель", "Попутчик" }
+                            })
+                            { ResizeKeyboard = true };
+                            await _bot.SendMessage(chatId, "Выберите роль:", replyMarkup: roleKeyboard2);
+                        }
+                        else if (text == "Редактировать данные")
+                        {
+                            SetUserState(chatId, "waiting_name");
+                            await _bot.SendMessage(chatId, "Введите новое имя:");
+                        }
+                        else if (text == "Управление рейсами" && _storage.Model.Users[chatId].Role == "Водитель")
+                        {
+                            await ShowDriverTrips(chatId);
+                        }
+                        break;
+                    }
                 case "driver_waiting_time":
-                    userData[chatId]["time"] = text;
-                    userStates[chatId] = "driver_waiting_car";
-                    await bot.SendMessage(chatId, "Введите марку автомобиля:");
-                    break;
-
-                case "driver_waiting_car":
-                    userData[chatId]["car"] = text;
-                    userStates[chatId] = "driver_waiting_departure";
-                    await bot.SendMessage(chatId, "Введите город отправления:");
-                    break;
-
-                case "driver_waiting_departure":
-                    userData[chatId]["departure"] = text;
-                    userStates[chatId] = "driver_waiting_arrival";
-                    await bot.SendMessage(chatId, "Введите город назначения:");
-                    break;
-
-                case "driver_waiting_arrival":
-                    userData[chatId]["arrival"] = text;
-                    userStates[chatId] = "driver_waiting_seats";
-                    await bot.SendMessage(chatId, "Введите количество мест:");
-                    break;
-
-                case "driver_waiting_seats":
-                    int seats = int.TryParse(text, out int s) ? s : 0;
-                    var trip = new Dictionary<string, object>
                     {
-                        {"driver_id", chatId},
-                        {"driver_name", userData[chatId]["name"]},
-                        {"car", userData[chatId].ContainsKey("car") ? userData[chatId]["car"] : "-"},
-                        {"date", userData[chatId]["date"]},
-                        {"time", userData[chatId]["time"]},
-                        {"departure", userData[chatId]["departure"]},
-                        {"arrival", userData[chatId]["arrival"]},
-                        {"seats", seats},
-                        {"passengers", new List<long>()}
-                    };
-                    trips[tripCounter] = trip;
+                        _storage.Model.Users[chatId].Time = text;
+                        SetUserState(chatId, "driver_waiting_car");
+                        await _bot.SendMessage(chatId, "Введите марку автомобиля:");
+                        _storage.MarkDirtyAndSave();
+                        break;
+                    }
+                case "driver_waiting_car":
+                    {
+                        _storage.Model.Users[chatId].Car = text;
+                        SetUserState(chatId, "driver_waiting_departure");
+                        await _bot.SendMessage(chatId, "Введите город отправления:");
+                        _storage.MarkDirtyAndSave();
+                        break;
+                    }
+                case "driver_waiting_departure":
+                    {
+                        _storage.Model.Users[chatId].Departure = text;
+                        SetUserState(chatId, "driver_waiting_arrival");
+                        await _bot.SendMessage(chatId, "Введите город назначения:");
+                        _storage.MarkDirtyAndSave();
+                        break;
+                    }
+                case "driver_waiting_arrival":
+                    {
+                        _storage.Model.Users[chatId].Arrival = text;
+                        SetUserState(chatId, "driver_waiting_seats");
+                        await _bot.SendMessage(chatId, "Введите количество мест:");
+                        _storage.MarkDirtyAndSave();
+                        break;
+                    }
+                case "driver_waiting_seats":
+                    {
+                        if (!int.TryParse(text, out int seats)) seats = 0;
 
-                    await bot.SendMessage(chatId,
-                        $"🚗 *Ваш рейс создан!* 🚗\n\n" +
-                        $"*Маршрут:* {userData[chatId]["departure"]} → {userData[chatId]["arrival"]}\n" +
-                        $"*Дата и время:* {userData[chatId]["date"]} {userData[chatId]["time"]}\n" +
-                        $"*Авто:* {userData[chatId]["car"]}\n" +
-                        $"*Мест:* {seats}\n\n" +
-                        $"Вы можете управлять рейсом через 'Управление рейсами'.",
-                        parseMode: ParseMode.Markdown,
-                        replyMarkup: MainMenu(chatId));
+                        var profile = _storage.Model.Users[chatId];
 
-                    tripCounter++;
-                    userStates[chatId] = "main_menu";
-                    break;
+                        // Последняя проверка лимита активных рейсов (на всякий случай)
+                        int active = CountActiveTripsForDriver(chatId);
+                        if (active >= MaxTripsPerDriver)
+                        {
+                            await _bot.SendMessage(chatId, $"❌ Нельзя создавать больше {MaxTripsPerDriver} активных рейсов. Удалите или дождитесь окончания одного из текущих рейсов.", replyMarkup: MainMenu(chatId));
+                            SetUserState(chatId, "main_menu");
+                            return;
+                        }
 
+                        var trip = new Trip
+                        {
+                            Id = _storage.Model.TripCounter,
+                            DriverId = chatId,
+                            DriverName = profile.Name,
+                            Car = profile.Car ?? "-",
+                            Date = profile.Date ?? DateTime.Today.ToString("dd.MM"),
+                            Time = profile.Time ?? DateTime.Now.ToString("HH:mm"),
+                            Departure = profile.Departure ?? "-",
+                            Arrival = profile.Arrival ?? "-",
+                            Seats = seats,
+                            Passengers = new List<long>()
+                        };
+
+                        // Добавляем и инкрементируем счётчик
+                        _storage.Model.Trips[trip.Id] = trip;
+                        _storage.Model.TripCounter++;
+                        _storage.MarkDirtyAndSave();
+
+                        string message =
+                            $"🚗 *Ваш рейс создан!* 🚗\n\n" +
+                            $"*Маршрут:* {trip.Departure} → {trip.Arrival}\n" +
+                            $"*Дата и время:* {trip.Date} {trip.Time}\n" +
+                            $"*Авто:* {trip.Car}\n" +
+                            $"*Мест:* {trip.Seats}\n\n" +
+                            $"Вы можете управлять рейсом через 'Управление рейсами'.";
+
+                        await _bot.SendMessage(chatId, message, ParseMode.Markdown, replyMarkup: MainMenu(chatId));
+
+                        SetUserState(chatId, "main_menu");
+                        break;
+                    }
                 case "passenger_departure":
-                    userData[chatId]["departure"] = text;
-                    userStates[chatId] = "passenger_arrival";
-                    await bot.SendMessage(chatId, "Введите город назначения:\n");
-                    break;
-
+                    {
+                        _storage.Model.Users[chatId].Departure = text;
+                        SetUserState(chatId, "passenger_arrival");
+                        await _bot.SendMessage(chatId, "Введите город назначения:");
+                        _storage.MarkDirtyAndSave();
+                        break;
+                    }
                 case "passenger_arrival":
-                    userData[chatId]["arrival"] = text;
-                    userStates[chatId] = "main_menu";
-                    await ShowMatchingTrips(chatId);
-                    break;
-
+                    {
+                        _storage.Model.Users[chatId].Arrival = text;
+                        SetUserState(chatId, "main_menu");
+                        _storage.MarkDirtyAndSave();
+                        await ShowMatchingTrips(chatId);
+                        break;
+                    }
                 case "driver_editing_route":
-                    int editTripId = int.Parse(userData[chatId]["editing_trip"]);
-                    trips[editTripId]["departure"] = text.Split('→')[0].Trim();
-                    trips[editTripId]["arrival"] = text.Split('→')[1].Trim();
-
-                    await UpdateDriverTripMessage(editTripId, true);
-                    userStates[chatId] = "main_menu";
-                    break;
+                    {
+                        // Ожидается, что editing_trip хранится во временных полях — используем поле Car как временное хранилище editing_trip id (можно изменить)
+                        // Чтобы не менять UserProfile, используем user state temp storage: store "editing_trip_{tripId}" в state
+                        state = GetUserState(chatId);
+                        if (state.StartsWith("driver_editing_route_"))
+                        {
+                            if (int.TryParse(state.Split('_').Last(), out int editTripId))
+                            {
+                                var parts = text.Split('→');
+                                if (parts.Length >= 2)
+                                {
+                                    lock (_stateLock)
+                                    {
+                                        if (_storage.Model.Trips.ContainsKey(editTripId))
+                                        {
+                                            _storage.Model.Trips[editTripId].Departure = parts[0].Trim();
+                                            _storage.Model.Trips[editTripId].Arrival = parts[1].Trim();
+                                            _storage.MarkDirtyAndSave();
+                                        }
+                                    }
+                                    await UpdateDriverTripMessage(editTripId, true);
+                                }
+                            }
+                        }
+                        SetUserState(chatId, "main_menu");
+                        break;
+                    }
+                default:
+                    {
+                        // Неизвестное состояние — сбрасываем в основное меню
+                        SetUserState(chatId, "main_menu");
+                        await _bot.SendMessage(chatId, "Используйте меню:", replyMarkup: MainMenu(chatId));
+                        break;
+                    }
             }
         }
 
-        if (update.Type == UpdateType.CallbackQuery)
-        {
-            var callback = update.CallbackQuery;
-            var chatId = callback.From.Id;
-            var data = callback.Data;
+        // ----------------- ОБРАБОТКА CALLBACK QUERY -----------------
 
-            if (userStates[chatId] == "driver_waiting_date" && data.StartsWith("date_"))
+        private async Task HandleCallback(CallbackQuery cb)
+        {
+            var chatId = cb.From.Id;
+            var data = cb.Data ?? "";
+
+            // Сначала проверим кейс выбора даты (driver_waiting_date)
+            if (GetUserState(chatId) == "driver_waiting_date" && data.StartsWith("date_"))
             {
                 string date = data.Split('_')[1];
-                userData[chatId]["date"] = date;
-                userStates[chatId] = "driver_waiting_time";
-                await bot.SendMessage(chatId, "Введите время отправления в формате ЧЧ:ММ (например 14:30):");
+                _storage.Model.Users[chatId].Date = date;
+                SetUserState(chatId, "driver_waiting_time");
+                await _bot.SendMessage(chatId, "Введите время отправления в формате ЧЧ:ММ (например 14:30):");
+                _storage.MarkDirtyAndSave();
+                return;
             }
-            else if (data.StartsWith("join_"))
+
+            if (data.StartsWith("join_"))
             {
-                int tripId = int.Parse(data.Split('_')[1]);
-                pendingRequests[tripId] = chatId;
-                var trip = trips[tripId];
-                long driverId = (long)trip["driver_id"];
-                await bot.SendMessage(driverId, $"Пассажир {userData[chatId]["name"]} (@{callback.From.Username ?? ""}, {userData[chatId]["phone"]}) хочет присоединиться к рейсу.");
+                if (!int.TryParse(data.Split('_')[1], out int tripId)) return;
+                if (!_storage.Model.Trips.ContainsKey(tripId))
+                {
+                    await _bot.SendMessage(chatId, "Рейс не найден или уже завершён.");
+                    return;
+                }
+
+                // Проверяем повторный запрос — pendingRequests хранит последний запрос на рейс
+                if (_storage.Model.PendingRequests.ContainsKey(tripId) && _storage.Model.PendingRequests[tripId] == chatId)
+                {
+                    await _bot.SendMessage(chatId, "Вы уже отправили запрос на этот рейс!");
+                    return;
+                }
+
+                _storage.Model.PendingRequests[tripId] = chatId;
+                _storage.MarkDirtyAndSave();
+
+                var trip = _storage.Model.Trips[tripId];
+                long driverId = trip.DriverId;
+                var passengerProfile = _storage.Model.Users.ContainsKey(chatId) ? _storage.Model.Users[chatId] : new UserProfile { ChatId = chatId, Name = "Пассажир", Phone = "" };
+
+                await _bot.SendMessage(driverId,
+                    $"Пассажир {passengerProfile.Name} (@{cb.From.Username ?? ""}, {passengerProfile.Phone}) хочет присоединиться к рейсу.");
+
                 var kb = new InlineKeyboardMarkup(new[]
                 {
                     new []{ InlineKeyboardButton.WithCallbackData("Подтвердить", "confirm_"+tripId), InlineKeyboardButton.WithCallbackData("Отклонить", "reject_"+tripId) }
                 });
-                await bot.SendMessage(driverId, "Подтвердите запрос:", replyMarkup: kb);
+                await _bot.SendMessage(driverId, "Подтвердите запрос:", replyMarkup: kb);
+                await _bot.SendMessage(chatId, "Запрос отправлен, ожидайте подтверждения!");
+                return;
             }
             else if (data.StartsWith("confirm_"))
             {
-                int tripId = int.Parse(data.Split('_')[1]);
-                if (!pendingRequests.ContainsKey(tripId)) return;
-                long passengerId = pendingRequests[tripId];
-                var trip = trips[tripId];
-                var passengerList = (List<long>)trip["passengers"];
-                if ((int)trip["seats"] > 0)
+                if (!int.TryParse(data.Split('_')[1], out int tripId)) return;
+                if (!_storage.Model.PendingRequests.ContainsKey(tripId)) return;
+
+                var passengerId = _storage.Model.PendingRequests[tripId];
+                if (!_storage.Model.Trips.ContainsKey(tripId))
                 {
-                    passengerList.Add(passengerId);
-                    trip["seats"] = (int)trip["seats"] - 1;
+                    await _bot.SendMessage(passengerId, "Рейс не найден или был отменён.");
+                    _storage.Model.PendingRequests.Remove(tripId);
+                    _storage.MarkDirtyAndSave();
+                    return;
+                }
 
-                    await bot.SendMessage(passengerId,
+                var trip = _storage.Model.Trips[tripId];
+                if (trip.Seats > 0)
+                {
+                    trip.Passengers.Add(passengerId);
+                    trip.Seats -= 1;
+
+                    // Отправляем пассажиру подтверждение
+                    var driverProfile = _storage.Model.Users.ContainsKey(trip.DriverId) ? _storage.Model.Users[trip.DriverId] : new UserProfile { Name = "Водитель", Phone = "" };
+                    string msg =
                         $"✅ *Ваше место подтверждено!* \n" +
-                        $"Маршрут: {trip["departure"]} → {trip["arrival"]}\n" +
-                        $"Дата и время: {trip["date"]} {trip["time"]}\n" +
-                        $"Водитель: {trip["driver_name"]} | @{(bot.GetChat((long)trip["driver_id"]).Result.Username ?? "")}\n" +
-                        $"Телефон водителя: {userData[(long)trip["driver_id"]]["phone"]}",
-                        parseMode: ParseMode.Markdown);
+                        $"Маршрут: {trip.Departure} → {trip.Arrival}\n" +
+                        $"Дата и время: {trip.Date} {trip.Time}\n" +
+                        $"Водитель: {trip.DriverName} | @{(_bot.GetChat(trip.DriverId).Result.Username ?? "")}\n" +
+                        $"Телефон водителя: {driverProfile.Phone}";
+                    await _bot.SendMessage(passengerId, msg, ParseMode.Markdown);
 
+                    _storage.MarkDirtyAndSave();
+
+                    // Обновляем сообщение водителя
                     await UpdateDriverTripMessage(tripId);
                 }
-                pendingRequests.Remove(tripId);
+                else
+                {
+                    await _bot.SendMessage(passengerId, "К сожалению, мест нет.");
+                }
+
+                _storage.Model.PendingRequests.Remove(tripId);
+                _storage.MarkDirtyAndSave();
+                return;
             }
             else if (data.StartsWith("reject_"))
             {
-                int tripId = int.Parse(data.Split('_')[1]);
-                if (!pendingRequests.ContainsKey(tripId)) return;
-                long passengerId = pendingRequests[tripId];
-                await bot.SendMessage(passengerId, $"❌ Ваш запрос отклонен.");
-                pendingRequests.Remove(tripId);
+                if (!int.TryParse(data.Split('_')[1], out int tripId)) return;
+                if (!_storage.Model.PendingRequests.ContainsKey(tripId)) return;
+
+                var passengerId = _storage.Model.PendingRequests[tripId];
+                await _bot.SendMessage(passengerId, $"❌ Ваш запрос отклонен.");
+                _storage.Model.PendingRequests.Remove(tripId);
+                _storage.MarkDirtyAndSave();
+                return;
             }
             else if (data.StartsWith("delete_"))
             {
-                int tripId = int.Parse(data.Split('_')[1]);
-                if (trips.ContainsKey(tripId) && (long)trips[tripId]["driver_id"] == chatId)
+                if (!int.TryParse(data.Split('_')[1], out int tripId)) return;
+                if (!_storage.Model.Trips.ContainsKey(tripId)) return;
+
+                var trip = _storage.Model.Trips[tripId];
+                if (trip.DriverId != chatId) // проверка прав
                 {
-                    var passengersList = (List<long>)trips[tripId]["passengers"];
-                    foreach (var pid in passengersList)
-                    {
-                        await bot.SendMessage(pid,
-                            $"❌ *Рейс отменён!* ❌\n" +
-                            $"Водитель {userData[chatId]["name"]} отменил рейс.\n" +
-                            $"Маршрут: {trips[tripId]["departure"]} → {trips[tripId]["arrival"]}\n" +
-                            $"Дата и время: {trips[tripId]["date"]} {trips[tripId]["time"]}",
-                            parseMode: ParseMode.Markdown
-                        );
-                    }
-                    trips.Remove(tripId);
-                    driverTripMessageId.Remove(tripId);
-                    await bot.SendMessage(chatId, $"🗑️ Рейс удалён.");
+                    await _bot.SendMessage(chatId, "Вы не являетесь владельцем этого рейса.");
+                    return;
                 }
+
+                // Уведомляем пассажиров
+                foreach (var pid in trip.Passengers.ToList())
+                {
+                    if (_storage.Model.Users.ContainsKey(pid))
+                    {
+                        await _bot.SendMessage(pid,
+                            $"❌ *Рейс отменён!* ❌\n" +
+                            $"Водитель {trip.DriverName} отменил рейс.\n" +
+                            $"Маршрут: {trip.Departure} → {trip.Arrival}\n" +
+                            $"Дата и время: {trip.Date} {trip.Time}",
+                            ParseMode.Markdown);
+                    }
+                }
+
+                _storage.Model.Trips.Remove(tripId);
+                if (_storage.Model.DriverTripMessageId.ContainsKey(tripId))
+                    _storage.Model.DriverTripMessageId.Remove(tripId);
+
+                _storage.MarkDirtyAndSave();
+                await _bot.SendMessage(chatId, $"🗑️ Рейс удалён.");
+                return;
             }
             else if (data.StartsWith("edit_"))
             {
-                int tripId = int.Parse(data.Split('_')[1]);
-                if (trips.ContainsKey(tripId) && (long)trips[tripId]["driver_id"] == chatId)
+                if (!int.TryParse(data.Split('_')[1], out int tripId)) return;
+                if (!_storage.Model.Trips.ContainsKey(tripId)) return;
+
+                var trip = _storage.Model.Trips[tripId];
+                if (trip.DriverId != chatId)
                 {
-                    userStates[chatId] = "driver_editing_route";
-                    userData[chatId]["editing_trip"] = tripId.ToString();
-                    await bot.SendMessage(chatId, "Введите новый маршрут в формате: Откуда → Куда");
+                    await _bot.SendMessage(chatId, "Вы не являетесь владельцем этого рейса.");
+                    return;
                 }
+
+                // Устанавливаем state "driver_editing_route_{tripId}" и просим ввести "Откуда → Куда"
+                SetUserState(chatId, $"driver_editing_route_{tripId}");
+                await _bot.SendMessage(chatId, "Введите новый маршрут в формате: Откуда → Куда");
+                return;
             }
             else if (data.StartsWith("cancel_"))
             {
-                int tripId = int.Parse(data.Split('_')[1]);
-                if (!trips.ContainsKey(tripId)) return;
-                long passengerId = callback.From.Id;
-                var trip = trips[tripId];
-                var passengerList = (List<long>)trip["passengers"];
+                if (!int.TryParse(data.Split('_')[1], out int tripId)) return;
+                if (!_storage.Model.Trips.ContainsKey(tripId)) return;
+
+                long passengerId = cb.From.Id;
+                var trip = _storage.Model.Trips[tripId];
+                var passengerList = trip.Passengers;
                 if (passengerList.Contains(passengerId))
                 {
                     passengerList.Remove(passengerId);
-                    trip["seats"] = (int)trip["seats"] + 1;
-                    await bot.SendMessage(passengerId, "❌ Вы отменили своё место в рейсе.");
+                    trip.Seats += 1;
+                    _storage.MarkDirtyAndSave();
+                    await _bot.SendMessage(passengerId, "❌ Вы отменили своё место в рейсе.");
                     await UpdateDriverTripMessage(tripId);
                 }
+                return;
             }
         }
-    }
 
-    static async Task ShowMatchingTrips(long chatId)
-    {
-        string dep = userData[chatId]["departure"];
-        string arr = userData[chatId]["arrival"];
-        bool found = false;
+        // ----------------- УТИЛИТЫ: вывод рейсов и обновления -----------------
 
-        foreach (var kv in trips)
+        private async Task ShowMatchingTrips(long chatId)
         {
-            var t = kv.Value;
-            string route = $"{t["departure"]} → {t["arrival"]}";
-            int seats = (int)t["seats"];
-            if (route.Contains(dep) && route.Contains(arr) && seats > 0)
+            var user = _storage.Model.Users[chatId];
+            string dep = user.Departure ?? "";
+            string arr = user.Arrival ?? "";
+            bool found = false;
+
+            // Чистим просроченные перед поиском
+            RemoveExpiredTrips();
+
+            foreach (var kv in _storage.Model.Trips.ToList())
             {
-                if (userData[chatId].ContainsKey("date") && t["date"].ToString() != userData[chatId]["date"]) continue;
+                var t = kv.Value;
+                string route = $"{t.Departure} → {t.Arrival}";
+                int seats = t.Seats;
+                if (string.IsNullOrEmpty(dep) || string.IsNullOrEmpty(arr)) continue;
 
-                found = true;
-                var kb = new InlineKeyboardMarkup(new[]
+                // Условие совпадения: маршрут содержит оба значения (простая логика как в оригинале)
+                if (route.Contains(dep, StringComparison.OrdinalIgnoreCase) && route.Contains(arr, StringComparison.OrdinalIgnoreCase) && seats > 0)
                 {
-                    new []{ InlineKeyboardButton.WithCallbackData("Выбрать рейс", "join_"+kv.Key) },
-                    new []{ InlineKeyboardButton.WithCallbackData("Отменить", "cancel_"+kv.Key) }
-                });
+                    // Если пользователь указал дату — сопоставим
+                    if (!string.IsNullOrEmpty(user.Date) && t.Date != user.Date) continue;
 
-                var driverId = (long)t["driver_id"];
-                await bot.SendMessage(chatId,
-                    $"🚗 *Рейс найден:*\n" +
-                    $"Маршрут: {route}\n" +
-                    $"Дата и время: {t["date"]} {t["time"]}\n" +
-                    $"Водитель: {t["driver_name"]} | @{(bot.GetChat(driverId).Result.Username ?? "")}\n" +
-                    $"Телефон водителя: {userData[driverId]["phone"]}\n" +
-                    $"Авто: {t["car"]}\n" +
-                    $"Осталось мест: {seats}",
+                    found = true;
+                    var kb = new InlineKeyboardMarkup(new[]
+                    {
+                        new []{ InlineKeyboardButton.WithCallbackData("Выбрать рейс", "join_"+kv.Key) },
+                        new []{ InlineKeyboardButton.WithCallbackData("Отменить", "cancel_"+kv.Key) }
+                    });
+
+                    var driverId = t.DriverId;
+                    string driverPhone = _storage.Model.Users.ContainsKey(driverId) ? _storage.Model.Users[driverId].Phone : "";
+
+                    string message =
+                        $"🚗 *Рейс найден:*\n" +
+                        $"Маршрут: {route}\n" +
+                        $"Дата и время: {t.Date} {t.Time}\n" +
+                        $"Водитель: {t.DriverName} | @{(_bot.GetChat(driverId).Result.Username ?? "")}\n" +
+                        $"Телефон водителя: {driverPhone}\n" +
+                        $"Авто: {t.Car}\n" +
+                        $"Осталось мест: {seats}";
+
+                    await _bot.SendMessage(chatId, message, ParseMode.Markdown, replyMarkup: kb);
+                }
+            }
+
+            if (!found)
+                await _bot.SendMessage(chatId, "❌ Нет подходящих рейсов.");
+        }
+
+        private async Task ShowDriverTrips(long chatId)
+        {
+            bool found = false;
+
+            // Чистим просроченные перед показом
+            RemoveExpiredTrips();
+
+            foreach (var kv in _storage.Model.Trips.ToList())
+            {
+                var trip = kv.Value;
+                if (trip.DriverId == chatId)
+                {
+                    found = true;
+                    var passengersList = trip.Passengers;
+                    string passengerInfo = passengersList.Count == 0 ? "Нет пассажиров" : "";
+                    foreach (var pid in passengersList)
+                    {
+                        if (_storage.Model.Users.ContainsKey(pid))
+                            passengerInfo += $"\n- {_storage.Model.Users[pid].Name} | @{(_bot.GetChat(pid).Result.Username ?? "")} | {_storage.Model.Users[pid].Phone}";
+                    }
+
+                    var kb = new InlineKeyboardMarkup(new[]
+                    {
+                        new []{ InlineKeyboardButton.WithCallbackData("Удалить", "delete_"+kv.Key), InlineKeyboardButton.WithCallbackData("Редактировать", "edit_"+kv.Key) }
+                    });
+
+                    string route = $"{trip.Departure} → {trip.Arrival}";
+                    var sentMessage = await _bot.SendMessage(chatId,
+                        $"🚗 *Ваш рейс:*\n" +
+                        $"Маршрут: {route}\n" +
+                        $"Дата и время: {trip.Date} {trip.Time}\n" +
+                        $"Авто: {trip.Car}\n" +
+                        $"Осталось мест: {trip.Seats}\n\n" +
+                        $"*Пассажиры:*{passengerInfo}",
+                        ParseMode.Markdown,
+                        replyMarkup: kb);
+
+                    _storage.Model.DriverTripMessageId[kv.Key] = sentMessage.MessageId;
+                    _storage.MarkDirtyAndSave();
+                }
+            }
+            if (!found)
+                await _bot.SendMessage(chatId, "❌ У вас пока нет созданных рейсов.");
+        }
+
+        private async Task UpdateDriverTripMessage(int tripId, bool notifyPassengers = false)
+        {
+            if (!_storage.Model.Trips.ContainsKey(tripId)) return;
+            if (!_storage.Model.DriverTripMessageId.ContainsKey(tripId)) return;
+
+            var trip = _storage.Model.Trips[tripId];
+            var passengersList = trip.Passengers;
+            string passengerInfo = passengersList.Count == 0 ? "Нет пассажиров" : "";
+            foreach (var pid in passengersList)
+            {
+                if (_storage.Model.Users.ContainsKey(pid))
+                    passengerInfo += $"\n- {_storage.Model.Users[pid].Name} | @{(_bot.GetChat(pid).Result.Username ?? "")} | {_storage.Model.Users[pid].Phone}";
+            }
+
+            var kb = new InlineKeyboardMarkup(new[]
+            {
+                new []{ InlineKeyboardButton.WithCallbackData("Удалить", "delete_"+tripId), InlineKeyboardButton.WithCallbackData("Редактировать", "edit_"+tripId) }
+            });
+
+            string route = $"{trip.Departure} → {trip.Arrival}";
+            try
+            {
+                await _bot.EditMessageText(
+                    chatId: trip.DriverId,
+                    messageId: _storage.Model.DriverTripMessageId[tripId],
+                    text: $"🚗 *Ваш рейс:*\n" +
+                          $"Маршрут: {route}\n" +
+                          $"Дата и время: {trip.Date} {trip.Time}\n" +
+                          $"Авто: {trip.Car}\n" +
+                          $"Осталось мест: {trip.Seats}\n\n" +
+                          $"*Пассажиры:*{passengerInfo}",
                     parseMode: ParseMode.Markdown,
                     replyMarkup: kb);
             }
-        }
-
-        if (!found)
-            await bot.SendMessage(chatId, "❌ Нет подходящих рейсов.");
-    }
-
-    static async Task ShowDriverTrips(long chatId)
-    {
-        bool found = false;
-        foreach (var kv in trips)
-        {
-            var trip = kv.Value;
-            if ((long)trip["driver_id"] == chatId)
+            catch (ApiRequestException)
             {
-                found = true;
-                var passengersList = (List<long>)trip["passengers"];
-                string passengerInfo = passengersList.Count == 0 ? "Нет пассажиров" : "";
-                foreach (var pid in passengersList)
-                    passengerInfo += $"\n- {userData[pid]["name"]} | @{(bot.GetChat(pid).Result.Username ?? "")} | {userData[pid]["phone"]}";
-
-                var kb = new InlineKeyboardMarkup(new[]
-                {
-                    new []{ InlineKeyboardButton.WithCallbackData("Удалить", "delete_"+kv.Key), InlineKeyboardButton.WithCallbackData("Редактировать", "edit_"+kv.Key) }
-                });
-
-                string route = $"{trip["departure"]} → {trip["arrival"]}";
-                var sentMessage = await bot.SendMessage(chatId,
-                    $"🚗 *Ваш рейс:*\n" +
-                    $"Маршрут: {route}\n" +
-                    $"Дата и время: {trip["date"]} {trip["time"]}\n" +
-                    $"Авто: {trip["car"]}\n" +
-                    $"Осталось мест: {trip["seats"]}\n\n" +
-                    $"*Пассажиры:*{passengerInfo}",
-                    parseMode: ParseMode.Markdown,
-                    replyMarkup: kb);
-
-                driverTripMessageId[kv.Key] = sentMessage.MessageId;
+                // Не обязательно фатальная ошибка — сообщение могло быть удалено вручную.
+                Console.WriteLine($"[UpdateDriverTripMessage] Не удалось отредактировать сообщение для рейса {tripId}");
             }
         }
-        if (!found)
-            await bot.SendMessage(chatId, "❌ У вас пока нет созданных рейсов.");
-    }
 
-    static async Task UpdateDriverTripMessage(int tripId, bool notifyPassengers = false)
-    {
-        if (!trips.ContainsKey(tripId) || !driverTripMessageId.ContainsKey(tripId)) return;
+        // ----------------- ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ -----------------
 
-        var trip = trips[tripId];
-        var passengersList = (List<long>)trip["passengers"];
-        string passengerInfo = passengersList.Count == 0 ? "Нет пассажиров" : "";
-        foreach (var pid in passengersList)
-            passengerInfo += $"\n- {userData[pid]["name"]} | @{(bot.GetChat(pid).Result.Username ?? "")} | {userData[pid]["phone"]}";
-
-        var kb = new InlineKeyboardMarkup(new[]
+        private ReplyKeyboardMarkup MainMenu(long chatId)
         {
-            new []{ InlineKeyboardButton.WithCallbackData("Удалить", "delete_"+tripId), InlineKeyboardButton.WithCallbackData("Редактировать", "edit_"+tripId) }
-        });
-
-        string route = $"{trip["departure"]} → {trip["arrival"]}";
-        await bot.EditMessageText(
-            chatId: (long)trip["driver_id"],
-            messageId: driverTripMessageId[tripId],
-            text: $"🚗 *Ваш рейс:*\n" +
-                  $"Маршрут: {route}\n" +
-                  $"Дата и время: {trip["date"]} {trip["time"]}\n" +
-                  $"Авто: {trip["car"]}\n" +
-                  $"Осталось мест: {trip["seats"]}\n\n" +
-                  $"*Пассажиры:*{passengerInfo}",
-            parseMode: ParseMode.Markdown,
-            replyMarkup: kb);
-    }
-
-    static ReplyKeyboardMarkup MainMenu(long chatId)
-    {
-        if (!userData.ContainsKey(chatId)) return null;
-
-        string role = userData[chatId].ContainsKey("role") ? userData[chatId]["role"] : "";
-        if (role == "Водитель")
-        {
-            return new ReplyKeyboardMarkup(
-                new KeyboardButton[][]
-                {
-                    new KeyboardButton[]{ new KeyboardButton("Создать рейс") },
-                    new KeyboardButton[]{ new KeyboardButton("Управление рейсами") },
-                    new KeyboardButton[]{ new KeyboardButton("Выбрать роль") },
-                    new KeyboardButton[]{ new KeyboardButton("Редактировать данные") }
-                })
-            { ResizeKeyboard = true };
-        }
-        else
-        {
-            return new ReplyKeyboardMarkup(
-                new KeyboardButton[][]
-                {
-                    new KeyboardButton[]{ new KeyboardButton("Поиск рейса") },
-                    new KeyboardButton[]{ new KeyboardButton("Выбрать роль") },
-                    new KeyboardButton[]{ new KeyboardButton("Редактировать данные") }
-                })
-            { ResizeKeyboard = true };
-        }
-    }
-
-    static InlineKeyboardMarkup DateKeyboard()
-    {
-        var buttons = new List<InlineKeyboardButton[]>();
-        DateTime today = DateTime.Today;
-        var row = new List<InlineKeyboardButton>();
-        for (int i = 0; i < 14; i++)
-        {
-            DateTime d = today.AddDays(i);
-            string text = d.ToString("dd.MM");
-            row.Add(InlineKeyboardButton.WithCallbackData(text, "date_" + text));
-            if (row.Count == 5)
+            var role = _storage.Model.Users.ContainsKey(chatId) ? _storage.Model.Users[chatId].Role : "";
+            if (role == "Водитель")
             {
-                buttons.Add(row.ToArray());
-                row = new List<InlineKeyboardButton>();
+                return new ReplyKeyboardMarkup(new[]
+                {
+                    new KeyboardButton[] { new KeyboardButton("Создать рейс") },
+                    new KeyboardButton[] { new KeyboardButton("Управление рейсами") },
+                    new KeyboardButton[] { new KeyboardButton("Выбрать роль") },
+                    new KeyboardButton[] { new KeyboardButton("Редактировать данные") }
+                })
+                { ResizeKeyboard = true };
+            }
+            else
+            {
+                return new ReplyKeyboardMarkup(new[]
+                {
+                    new KeyboardButton[] { new KeyboardButton("Поиск рейса") },
+                    new KeyboardButton[] { new KeyboardButton("Выбрать роль") },
+                    new KeyboardButton[] { new KeyboardButton("Редактировать данные") }
+                })
+                { ResizeKeyboard = true };
             }
         }
-        if (row.Count > 0) buttons.Add(row.ToArray());
-        return new InlineKeyboardMarkup(buttons);
+
+        private InlineKeyboardMarkup DateKeyboard()
+        {
+            var buttons = new List<InlineKeyboardButton[]>();
+            DateTime today = DateTime.Today;
+            var row = new List<InlineKeyboardButton>();
+            for (int i = 0; i < 14; i++)
+            {
+                DateTime d = today.AddDays(i);
+                string text = d.ToString("dd.MM");
+                row.Add(InlineKeyboardButton.WithCallbackData(text, "date_" + text));
+                if (row.Count == 5)
+                {
+                    buttons.Add(row.ToArray());
+                    row = new List<InlineKeyboardButton>();
+                }
+            }
+            if (row.Count > 0) buttons.Add(row.ToArray());
+            return new InlineKeyboardMarkup(buttons);
+        }
+
+        /// <summary>
+        /// Удаляет рейсы, если их дата/время уже прошли.
+        /// Уведомляет пассажиров при удалении (опционально можно добавлять причину).
+        /// </summary>
+        private void RemoveExpiredTrips()
+        {
+            lock (_stateLock)
+            {
+                var now = DateTime.Now;
+                var expired = _storage.Model.Trips.Values.Where(t => t.GetDateTimeOrMin() != DateTime.MinValue && t.GetDateTimeOrMin() < now).Select(t => t.Id).ToList();
+                if (expired.Count == 0) return;
+
+                foreach (var id in expired)
+                {
+                    var trip = _storage.Model.Trips[id];
+                    // Уведомляем пассажиров, что рейс удалён из-за прошедшего времени (если нужно)
+                    foreach (var pid in trip.Passengers)
+                    {
+                        try
+                        {
+                            _bot.SendMessage(pid,
+                                $"ℹ️ Рейс {trip.Departure} → {trip.Arrival} от {trip.Date} {trip.Time} завершён и удалён.");
+                        }
+                        catch { /*ignore*/ }
+                    }
+                    _storage.Model.Trips.Remove(id);
+                    if (_storage.Model.DriverTripMessageId.ContainsKey(id))
+                        _storage.Model.DriverTripMessageId.Remove(id);
+                }
+                _storage.MarkDirtyAndSave();
+                Console.WriteLine($"[Cleanup] Удалено {expired.Count} просроченных рейсов.");
+            }
+        }
+
+        private int CountActiveTripsForDriver(long driverId)
+        {
+            var now = DateTime.Now;
+            return _storage.Model.Trips.Values.Count(t => t.DriverId == driverId && t.GetDateTimeOrMin() != DateTime.MinValue && t.GetDateTimeOrMin() >= now);
+        }
+
+        private string GetUserState(long chatId)
+        {
+            lock (_stateLock)
+            {
+                if (!_userStates.ContainsKey(chatId)) _userStates[chatId] = "waiting_name";
+                return _userStates[chatId];
+            }
+        }
+
+        private void SetUserState(long chatId, string state)
+        {
+            lock (_stateLock)
+            {
+                _userStates[chatId] = state;
+            }
+        }
     }
 
-    static Task ErrorHandler(ITelegramBotClient botClient, Exception exception, CancellationToken ct)
+    // ----- ПРОГРАММА: входная точка -----
+
+    class Program
     {
-        Console.WriteLine(exception.Message);
-        return Task.CompletedTask;
+        // Вставьте ваш токен ниже
+        static string token = "8481717669:AAGZV3qnhxDIjdC0vxqR3FvDQMv7HGWwE6g";
+
+        static async Task Main(string[] args)
+        {
+            // Инициализируем storage и загружаем существующие данные
+            var storage = new Storage("data.json");
+            storage.Load();
+
+            // Создаём сервис бота
+            var botService = new BotService(token, storage);
+
+            // Запускаем бот
+            using var cts = new CancellationTokenSource();
+            await botService.StartAsync(cts.Token);
+
+            Console.WriteLine("Нажмите Ctrl+C для остановки...");
+            // Блокируем главный поток, пока не придёт отмена
+            try
+            {
+                await Task.Delay(Timeout.Infinite, cts.Token);
+            }
+            catch (TaskCanceledException) { }
+        }
     }
 }
